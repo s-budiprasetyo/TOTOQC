@@ -8,18 +8,6 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-# Mode SATU APLIKASI: bila Secrets berisi satu_app = true, alamat ini menjalankan app.py (2 halaman dalam 1 app).
-if __name__ == "__main__":
-    try:
-        _satu = bool(st.secrets.get("satu_app", False))
-    except Exception:  # belum ada file secrets
-        _satu = False
-    if _satu:
-        import os as _os
-        from core import nav as _nav
-        _nav.jalankan(_os.path.dirname(_os.path.abspath(__file__)))
-        st.stop()
-
 from core import data, logic, parsers
 from core.bulan import pilih_bulan
 from core.tabel import tabel
@@ -29,8 +17,7 @@ from core.ui import gaya_global, gaya_responsif, kepala_pub, kontrol_jendela_pub
 BULAN = ["JANUARI", "FEBRUARI", "MARET", "APRIL", "MEI", "JUNI", "JULI", "AGUSTUS",
          "SEPTEMBER", "OKTOBER", "NOVEMBER", "DESEMBER"]
 
-if __name__ == "__main__":  # bila dijalankan lewat app.py, set_page_config sudah dipanggil app.py
-    st.set_page_config(page_title="Monitoring Hasil Kerja Karyawan", layout="wide")
+st.set_page_config(page_title="Monitoring Hasil Kerja Karyawan", layout="wide")
 
 if st.query_params.get("privasi") is not None:  # halaman kebijakan privasi (dipakai di konfigurasi login Google)
     st.title("Kebijakan Privasi — Monitoring QC TOTO")
@@ -530,11 +517,11 @@ elif kanan.button("LOGIN", type="primary", width="stretch"):
 
 
 @st.cache_data(ttl=60, show_spinner="Memuat data…")
-def rekap(bln, versi_data):  # versi_data ikut kunci cache: setelah admin upload, tabel langsung memakai data baru
+def rekap(bln):
     return logic.rekap_bulan(bln)
 
 
-baris = rekap(bulan, data.versi())
+baris = rekap(bulan)
 # tampilan smartphone: admin boleh melihat siapa pun (pilih nama), karyawan hanya dirinya; belum login = tabel ringkas
 _me = st.session_state.get("me")
 if st.session_state.get("adm"):

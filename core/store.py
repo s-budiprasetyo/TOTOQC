@@ -56,6 +56,18 @@ class LocalStore:
     def tables(self):
         return [f[:-4] for f in os.listdir(self.folder) if f.endswith(".csv")]
 
+    def read_bulan(self, nama, bulan):
+        d = self.read(nama)
+        return d[d["id"].str.contains(f"|{bulan}-", regex=False)].reset_index(drop=True)
+
+    def write_bulan(self, nama, bulan, df):
+        d = self.read(nama)
+        d = d[~d["id"].str.contains(f"|{bulan}-", regex=False)]
+        self.write(nama, pd.concat([d, df], ignore_index=True))
+
+    def pastikan_bulan(self, bulan):
+        return True
+
     def write_laporan(self, nama, df, bulan=None):
         df.to_csv(self._path("laporan_" + nama.replace(" ", "_")), index=False)
 
@@ -83,6 +95,7 @@ class _Buku:
         self._gs = gspread
         self.sh = sh
         self._tabs = None
+        self._tabs_waktu = 0.0
         self._snap = None  # (waktu, {tab: baris}) hasil satu kali baca banyak tab sekaligus
 
     def _retry(self, fn):
@@ -98,7 +111,16 @@ class _Buku:
     def _sheets(self, segar=False):
         if self._tabs is None or segar:
             self._tabs = {w.title: w for w in self._retry(self.sh.worksheets)}
+            self._tabs_waktu = time.time()
         return self._tabs
+
+    def punya_tab(self, nama):
+        """Ada tab ini di buku? Bila belum tampak, daftar tab dibaca ulang (paling sering tiap 20 detik) karena tab
+        bisa dibuat oleh aplikasi lain (admin vs utama)."""
+        ada = nama in self._sheets()
+        if not ada and time.time() - self._tabs_waktu > 20:
+            ada = nama in self._sheets(segar=True)
+        return ada
 
     def _segarkan_bila_tab_hilang(self, fn):
         """Tab bisa dihapus/diganti manual di Google Sheet; daftar tab yang tersimpan jadi basi (error 400).
@@ -118,7 +140,7 @@ class _Buku:
         if self._snap and time.time() - self._snap[0] < 20:
             return self._snap[1]
         try:
-            judul = [t for t in self._sheets() if t not in TAB_LAPORAN and t != "foto_alasan" and not _POLA_BULAN.match(t)]
+            judul = [t for t in self._sheets(segar=True) if t not in TAB_LAPORAN and t != "foto_alasan" and not _POLA_BULAN.match(t)]
             rng = ["'" + t.replace("'", "''") + "'" for t in judul]
             vr = self._retry(lambda: self.sh.values_batch_get(rng)).get("valueRanges", [])
             hasil = {t: vr[i].get("values", []) for i, t in enumerate(judul)}
@@ -134,6 +156,8 @@ class _Buku:
     def read(self, nama):
         def kerja():
             ws = self._sheets().get(nama)
+            if ws is None and self.punya_tab(nama):
+                ws = self._sheets().get(nama)
             if ws is None:
                 return pd.DataFrame(columns=kolom_tabel(nama))
             snap = None if nama == "foto_alasan" or _POLA_BULAN.match(nama) else self._snapshot()
@@ -161,8 +185,11 @@ class _Buku:
                 self._tabs[nama] = ws
             self._retry(ws.clear)
             self._retry(lambda: ws.resize(rows=baris, cols=kol))
-            self._retry(lambda: ws.update(range_name="A1", values=[list(df.columns)] + df.values.tolist(),
-                                          value_input_option="RAW"))
+            semua = [list(df.columns)] + df.values.tolist()
+            # dipecah per bagian (<= ~150 ribu sel) supaya tidak melewati batas ukuran kiriman Google
+            per = max(50, 150000 // max(1, len(df.columns)))
+            for i in range(0, len(semua), per):
+                self._retry(lambda i=i: ws.update(range_name=f"A{i + 1}", values=semua[i:i + per], value_input_option="RAW"))
         self._segarkan_bila_tab_hilang(kerja)
         if nama not in TAB_LAPORAN:
             try:
@@ -258,12 +285,23 @@ class _Buku:
 
 
 _POLA_BULAN = re.compile(r"^(?:hasil|jadwal)_(\d{4}-\d{2})$")
+# tabel yang tumbuh tiap bulan: disimpan di Google Sheet bulan masing-masing (dipilah menurut kolom tgl)
+TABEL_BULANAN = ("lembur", "absensi", "alasan", "pengajuan", "kegiatan", "pindah_hasil", "masalah_abaikan")
+JUDUL_BUKU = ("TOTOQC {b}", "QCTOTO {b}")  # nama kedua hanya toleransi salah ketik
+
+
+class BukuBulananBelumAda(Exception):
+    """Upload ditolak: Google Sheet bulan itu belum ada / belum dibagikan / belum dihubungkan."""
+
+
+def _urut(df):
+    return sorted(map(tuple, df.fillna("").astype(str).values.tolist()))
 
 
 class SheetsStore:
-    """Google Sheet utama (pengaturan, absensi, lembur, alasan, dll) + satu Google Sheet per bulan di folder Drive
-    (tabel hasil_ dan jadwal_ bulan itu serta dua tab laporan bulan itu). Bulan yang sudah ada di Sheet utama tetap
-    di sana; bulan baru otomatis dibuatkan Google Sheet sendiri bila drive_folder_id diisi."""
+    """Dua jenis Google Sheet. (1) Sheet UTAMA = master kecil: karyawan, target, alias, bagian, roster, daftar bulan.
+    (2) Satu Sheet per bulan "TOTOQC YYYY-MM": hasil, jadwal, lembur, absensi, alasan + foto, pengajuan, kegiatan, dll.
+    serta dua tab laporan bulan itu. Bulan lama yang belum punya Sheet sendiri tetap dibaca dari Sheet utama."""
     def __init__(self, creds, sheet_id, folder_id=None):
         import gspread
         self._gs = gspread
@@ -273,10 +311,13 @@ class SheetsStore:
         self.sh = self.utama.sh
         self._buku = {}          # bulan -> _Buku
         self._reg = None         # bulan -> sheet_id (tembolok daftar buku)
-        self._dicari = set()
-        self.peringatan = []     # pesan masalah (mis. gagal membuat Google Sheet bulan baru)
+        self._dicari = {}        # bulan -> waktu terakhir dicari
+        self.peringatan = []     # pesan masalah
 
     _retry = _Buku._retry
+
+    def _email_akun(self):
+        return getattr(getattr(self.klien, "auth", None), "service_account_email", "akun layanan")
 
     # --- daftar buku bulanan (tabel 'buku_bulan' di Sheet utama)
     def _registri(self, segar=False):
@@ -299,72 +340,142 @@ class SheetsStore:
 
     def _daftarkan(self, bulan, sh, judul):
         reg = self.utama.read("buku_bulan")
+        reg = reg[reg["bulan"] != bulan]
         reg = pd.concat([reg, pd.DataFrame([{"bulan": bulan, "sheet_id": sh.id, "nama": judul}])], ignore_index=True)
         self.utama.write("buku_bulan", reg)
         self._reg = None
         self._buku[bulan] = _Buku(sh)
         return self._buku[bulan]
 
-    def _cari(self, bulan):
-        """Cari Google Sheet 'TOTOQC <bulan>' yang sudah ada di folder Drive (dibuat manual oleh admin) lalu daftarkan."""
-        if not self.folder_id:
-            return None
-        judul = f"TOTOQC {bulan}"
+    def hubungkan_link(self, bulan, tautan):
+        """Admin menempel link/ID Google Sheet bulan itu. Return nama file. ValueError bila tidak bisa dibuka."""
+        m = re.search(r"/d/([A-Za-z0-9_-]{20,})", tautan or "") or re.fullmatch(r"\s*([A-Za-z0-9_-]{30,})\s*", tautan or "")
+        if not m:
+            raise ValueError("Link tidak dikenali. Salin alamat lengkap Google Sheet dari browser (https://docs.google.com/spreadsheets/d/...).")
+        if m.group(1) == self.sh.id:
+            raise ValueError("Itu link Sheet UTAMA (master). Tempel link Sheet khusus bulan ini.")
         try:
-            ada = self._retry(lambda: self.klien.list_spreadsheet_files(title=judul, folder_id=self.folder_id))
-            ada = [a for a in ada if a.get("name") == judul]
-            if not ada:
-                return None
-            sh = self._retry(lambda: self.klien.open_by_key(ada[0]["id"]))
+            sh = self._retry(lambda: self.klien.open_by_key(m.group(1)))
         except Exception as e:
-            self.peringatan.append(f"Gagal mencari Google Sheet {judul} di folder Drive: {type(e).__name__}: {e}")
-            return None
-        return self._daftarkan(bulan, sh, judul)
+            raise ValueError(f"File tidak bisa dibuka. Pastikan sudah dibagikan ke {self._email_akun()} sebagai Editor. ({type(e).__name__})")
+        self._daftarkan(bulan, sh, sh.title)
+        return sh.title
 
-    def _buat(self, bulan):
-        """Buat Google Sheet bulan baru di folder Drive lalu catat di daftar. None bila tidak bisa."""
-        if not self.folder_id:
+    def _cari(self, bulan):
+        """Cari Google Sheet 'TOTOQC <bulan>' yang dibagikan ke akun layanan (dibuat manual oleh admin) lalu daftarkan."""
+        if time.time() - self._dicari.get(bulan, 0) < 30:
             return None
-        judul = f"TOTOQC {bulan}"
+        self._dicari[bulan] = time.time()
         try:
-            sh = self._retry(lambda: self.klien.create(judul, folder_id=self.folder_id))
+            for pola in JUDUL_BUKU:
+                judul = pola.format(b=bulan)
+                ada = self._retry(lambda: self.klien.list_spreadsheet_files(title=judul, folder_id=self.folder_id))
+                ada = [a for a in ada if a.get("name") == judul and a.get("id") != self.sh.id]
+                if ada:
+                    sh = self._retry(lambda: self.klien.open_by_key(ada[0]["id"]))
+                    return self._daftarkan(bulan, sh, judul)
         except Exception as e:
-            if "quota" in str(e).lower():
-                self.peringatan.append(
-                    f"Google tidak mengizinkan akun layanan membuat file baru (kuota Drive akun layanan nol). Buat sendiri Google Sheet kosong "
-                    f"bernama {judul} di folder Drive, bagikan ke {getattr(getattr(self.klien, 'auth', None), 'service_account_email', 'akun layanan')} sebagai Editor, "
-                    f"lalu unggah ulang file bulan ini. Sementara data disimpan di Sheet utama.")
-            else:
-                self.peringatan.append(f"Gagal membuat Google Sheet {judul} di folder Drive: {type(e).__name__}: {e}")
-            return None
-        return self._daftarkan(bulan, sh, judul)
+            self.peringatan.append(f"Gagal mencari Google Sheet bulan {bulan}: {type(e).__name__}: {e}")
+        return None
+
+    def _buku_bulan(self, bulan):
+        """Buku bulan itu (terdaftar, atau ditemukan lewat nama). None bila belum ada."""
+        return self._buka(bulan) or self._cari(bulan)
+
+    def pastikan_bulan(self, bulan):
+        """Dipanggil sebelum menyimpan data bulan itu. Lolos bila ada buku bulanan, atau bulan lama yang
+        masih di Sheet utama. Selain itu upload ditolak."""
+        if self._buku_bulan(bulan):
+            return True
+        if any(f"{p}_{bulan}" in self.utama.tables(segar=False) for p in ("hasil", "jadwal")):
+            return True
+        raise BukuBulananBelumAda(
+            f"Google Sheet bulan {bulan} belum terhubung, jadi upload DIBATALKAN (tidak ada data yang tersimpan). "
+            f"Buat Google Sheet kosong bernama TOTOQC {bulan}, bagikan ke {self._email_akun()} sebagai Editor, "
+            f"atau tempel linknya di bagian Informasi → Hubungkan Google Sheet bulanan. Lalu ulangi upload.")
 
     def _untuk_tulis(self, nama):
         m = _POLA_BULAN.match(nama)
         if not m:
             return self.utama
-        bulan = m.group(1)
-        b = self._buka(bulan)
-        if b:
-            return b
-        if bulan not in self._dicari:  # sekali per bulan: adakah Google Sheet buatan manual di folder?
-            self._dicari.add(bulan)
-            b = self._cari(bulan)
-            if b:
-                return b
-        ada = {f"hasil_{bulan}", f"jadwal_{bulan}"} & set(self.utama.tables(segar=False))
-        if ada:  # bulan lama yang sudah di Sheet utama tetap di sana
-            return self.utama
-        return self._buat(bulan) or self.utama
+        self.pastikan_bulan(m.group(1))
+        return self._buku_bulan(m.group(1)) or self.utama
 
     def _untuk_baca(self, nama):
         m = _POLA_BULAN.match(nama)
-        return (self._buka(m.group(1)) if m else None) or self.utama
+        if not m:
+            return self.utama
+        b = self._buka(m.group(1))
+        if b is not None and b.punya_tab(nama):
+            return b
+        return self.utama  # bulan lama / belum dipindah: masih di Sheet utama
+
+    # --- tabel bulanan (lembur, absensi, ...): dipilah menurut bulan dari kolom tgl
+    def _baca_bulanan(self, nama):
+        master = self.utama.read(nama)
+        bagian, di_buku = [], set()
+        for bulan in sorted(self._registri()):
+            try:
+                b = self._buka(bulan)
+                if b is not None and b.punya_tab(nama):
+                    bagian.append(b.read(nama))
+                    di_buku.add(bulan)
+            except Exception as e:
+                self.peringatan.append(f"Gagal membaca {nama} bulan {bulan}: {type(e).__name__}: {e}")
+        if di_buku:
+            master = master[~master["tgl"].astype(str).str[:7].isin(di_buku)]
+        return pd.concat([master] + bagian, ignore_index=True) if bagian else master
+
+    def _tulis_bulanan(self, nama, df):
+        kol = kolom_tabel(nama)
+        df = df.fillna("").astype(str)
+        for c in kol:
+            if c not in df.columns:
+                df[c] = ""
+        df = df[kol]
+        bln = df["tgl"].str[:7]
+        punya_buku = set()
+        for bulan in sorted(self._registri()):
+            b = self._buka(bulan)
+            if b is None:
+                continue
+            punya_buku.add(bulan)
+            bag = df[bln == bulan].reset_index(drop=True)
+            ada = b.punya_tab(nama)
+            if not ada and bag.empty:
+                continue
+            if ada and _urut(b.read(nama)[kol]) == _urut(bag):
+                continue
+            b.write(nama, bag)  # buku bulan ditulis LEBIH DULU; bila gagal, Sheet utama belum disentuh
+        sisa = df[~bln.isin(punya_buku)].reset_index(drop=True)
+        if _urut(self.utama.read(nama)[kol]) != _urut(sisa):
+            self.utama.write(nama, sisa)
+
+    # --- foto alasan: satu tab per bulan (dipilih dari tanggal di id foto "prn|tgl|no")
+    def read_bulan(self, nama, bulan):
+        b = self._buka(bulan)
+        if b is not None and b.punya_tab(nama):
+            return b.read(nama)
+        d = self.utama.read(nama)  # data lama di Sheet utama
+        return d[d["id"].str.contains(f"|{bulan}-", regex=False)].reset_index(drop=True)
+
+    def write_bulan(self, nama, bulan, df):
+        b = self._buka(bulan)
+        if b is not None:
+            b.write(nama, df)
+            return
+        d = self.utama.read(nama)
+        d = d[~d["id"].str.contains(f"|{bulan}-", regex=False)]
+        self.utama.write(nama, pd.concat([d, df], ignore_index=True))
 
     def read(self, nama):
+        if nama in TABEL_BULANAN:
+            return self._baca_bulanan(nama)
         return self._untuk_baca(nama).read(nama)
 
     def write(self, nama, df):
+        if nama in TABEL_BULANAN:
+            return self._tulis_bulanan(nama, df)
         self._untuk_tulis(nama).write(nama, df)
 
     def tables(self):
@@ -377,6 +488,91 @@ class SheetsStore:
             except Exception:
                 pass
         return hasil
+
+
+    # --- merapikan Sheet utama: periksa / salin / hapus salinan lama bulan yang sudah punya Sheet sendiri
+    def _kunci_cek(self, nama):
+        return ["tgl"] if nama.startswith("hasil_") else ["prn", "tgl"]
+
+    def audit_bulan(self, bulan):
+        """Bandingkan Sheet utama dengan Sheet bulan. Return list dict(tabel, master, buku, status) dengan status:
+        'aman' (salinan master boleh dihapus), 'salin' (ada data di master yang belum ada di Sheet bulan), 'kosong' (tidak ada di master)."""
+        b = self._buka(bulan)
+        if b is None:
+            raise ValueError(f"Sheet bulan {bulan} belum terhubung.")
+        ada_master = set(self.utama.tables(segar=True))
+        hasil = []
+        for nama in (f"hasil_{bulan}", f"jadwal_{bulan}"):
+            m = self.utama.read(nama) if nama in ada_master else None
+            k = b.read(nama) if b.punya_tab(nama) else None
+            if m is None:
+                hasil.append(dict(tabel=nama, master=0, buku=0 if k is None else len(k), status="kosong"))
+                continue
+            kc = self._kunci_cek(nama)
+            kunci_k = set(map(tuple, k[kc].values.tolist())) if k is not None else set()
+            kurang = [t for t in map(tuple, m[kc].values.tolist()) if t not in kunci_k]
+            hasil.append(dict(tabel=nama, master=len(m), buku=0 if k is None else len(k), status="salin" if kurang else "aman"))
+        for nama in TABEL_BULANAN:
+            m = self.utama.read(nama)
+            m = m[m["tgl"].astype(str).str[:7] == bulan]
+            hasil.append(dict(tabel=nama, master=len(m), buku=0, status="salin" if len(m) else "kosong"))
+        f = self.utama.read("foto_alasan") if "foto_alasan" in ada_master else pd.DataFrame(columns=["id", "data"])
+        f = f[f["id"].str.contains(f"|{bulan}-", regex=False)]
+        kf = b.read("foto_alasan") if b.punya_tab("foto_alasan") else pd.DataFrame(columns=["id", "data"])
+        kurang = set(f["id"]) - set(kf["id"])
+        hasil.append(dict(tabel="foto_alasan", master=len(f), buku=len(kf),
+                          status="kosong" if not len(f) else ("salin" if kurang else "aman")))
+        return hasil
+
+    def salin_bulan(self, bulan):
+        """Salin (bukan pindah) data bulan itu dari Sheet utama ke Sheet bulan. Tidak ada yang dihapus. Return jumlah tabel disalin."""
+        b = self._buka(bulan)
+        if b is None:
+            raise ValueError(f"Sheet bulan {bulan} belum terhubung.")
+        n = 0
+        for a in self.audit_bulan(bulan):
+            if a["status"] != "salin":
+                continue
+            nama = a["tabel"]
+            if nama in TABEL_BULANAN:
+                self._tulis_bulanan(nama, self._baca_bulanan(nama))  # buku ditulis dulu, lalu master dirapikan
+            elif nama == "foto_alasan":
+                m = self.utama.read(nama)
+                m = m[m["id"].str.contains(f"|{bulan}-", regex=False)]
+                k = b.read(nama) if b.punya_tab(nama) else pd.DataFrame(columns=["id", "data"])
+                b.write(nama, pd.concat([k, m[~m["id"].isin(set(k["id"]))]], ignore_index=True))
+            else:
+                m = self.utama.read(nama)
+                if b.punya_tab(nama):
+                    k = b.read(nama)
+                    kc = self._kunci_cek(nama)
+                    ada = set(map(tuple, k[kc].values.tolist()))
+                    baru = m[[tuple(r) not in ada for r in m[kc].values.tolist()]]
+                    gab = pd.concat([k, baru], ignore_index=True)
+                else:
+                    gab = m
+                b.write(nama, gab)
+            n += 1
+        return n
+
+    def hapus_dari_master(self, bulan):
+        """Hapus salinan lama di Sheet utama, HANYA untuk tabel yang diperiksa 'aman'. Return daftar tabel yang dihapus."""
+        dihapus = []
+        for a in self.audit_bulan(bulan):
+            if a["status"] != "aman":
+                continue
+            if a["tabel"] == "foto_alasan":  # hanya baris bulan itu yang dihapus dari master
+                f = self.utama.read("foto_alasan")
+                self.utama.write("foto_alasan", f[~f["id"].str.contains(f"|{bulan}-", regex=False)])
+                dihapus.append("foto_alasan (baris bulan ini)")
+                continue
+            ws = self.utama._sheets(segar=True).get(a["tabel"])
+            if ws is not None:
+                self._retry(lambda: self.sh.del_worksheet(ws))
+                self.utama._sheets(segar=True)
+                self.utama._lepas_snapshot()
+                dihapus.append(a["tabel"])
+        return dihapus
 
     # --- laporan (tab terlihat). bulan=None -> Sheet utama
     def _buku_laporan(self, bulan):

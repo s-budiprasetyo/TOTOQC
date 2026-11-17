@@ -30,14 +30,3 @@ Jadwal Kerja (upload QC/SK + Setting Manual), Absensi, Lembur, tampilan admin ba
 ## Tahap 5
 - Kotak kosong di tabel bisa diklik (setelah login) untuk mencatat kegiatan lain; muncul kotak biru K.
 - Google Sheet bulanan otomatis: lihat PANDUAN_SHEET_BULANAN.md.
-
-
-## Tahap 6f — SATU APLIKASI, DUA HALAMAN (tanpa st.navigation)
-- `app.py` = pintu masuk tunggal. `app_publik.py` (halaman utama) dan `app_admin.py` (halaman admin) dijalankan **apa adanya**,
-  satu per satu, bukan digabung dan bukan lewat `st.navigation`.
-- Tombol **⚙ HALAMAN ADMIN** (pojok kiri atas) muncul hanya setelah admin login di halaman utama; di halaman admin ada **← HALAMAN UTAMA**.
-  Halaman admin tetap dijaga user + password admin.
-- Saat pindah halaman, semua state halaman lama dibersihkan (jendela terbuka, klik tertunda, isian tabel, unggahan). Yang terbawa hanya
-  status login. Daftarnya ada di `core/nav.py` (`PERTAHAN`).
-- Cara pasang di Streamlit Cloud: lihat `PANDUAN_SATU_APLIKASI.md`. Uji di komputer: `streamlit run app.py`.
-- Dua file lama tetap bisa dijalankan sendiri-sendiri (`streamlit run app_publik.py` / `app_admin.py`) sebagai cadangan.
